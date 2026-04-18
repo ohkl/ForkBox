@@ -6,15 +6,9 @@ on:
       - 'v*'
       - 'release-*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'Release version (optional)'
-        required: false
-        default: ''
 
 env:
-  QT_VERSION: 6.5.0
-  CMAKE_VERSION: 3.27.0
+  QT_VERSION: 6.7.0
 
 jobs:
   build-release:
@@ -27,15 +21,12 @@ jobs:
           - os: ubuntu-latest
             artifact_name: nekobox
             asset_name: nekobox-linux-x64
-            build_cmd: cmake --build . --config Release -j$(nproc)
           - os: macos-latest
             artifact_name: nekobox
             asset_name: nekobox-macos-x64
-            build_cmd: cmake --build . --config Release -j$(sysctl -n hw.ncpu)
           - os: windows-latest
             artifact_name: Release/nekobox.exe
             asset_name: nekobox-windows-x64.exe
-            build_cmd: cmake --build . --config Release -j%NUMBER_OF_PROCESSORS%
 
     steps:
       - name: Checkout repository
@@ -44,90 +35,87 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Setup CMake
-        uses: cmake-js/setup-cmake@v3
-        with:
-          cmake-version: ${{ env.CMAKE_VERSION }}
+      - name: Setup CMake and Ninja (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Setup CMake and Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja
+
+      - name: Setup CMake and Ninja (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install cmake ninja -y
 
       - name: Setup Qt (Linux)
         if: runner.os == 'Linux'
-        uses: jurplel/install-qt-action@v3
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: 'linux'
-          target: 'desktop'
-          modules: 'qtbase qtdeclarative'
-          cache: 'true'
+        run: |
+          sudo apt-get install -y \
+            qt6-base-dev \
+            qt6-svg-dev \
+            libgl1-mesa-dev \
+            libxkbcommon-x11-dev
 
       - name: Setup Qt (macOS)
         if: runner.os == 'macOS'
-        uses: jurplel/install-qt-action@v3
-        with:
-          version: ${{ env.QT_VERSION }}
-          host: 'mac'
-          target: 'desktop'
-          modules: 'qtbase qtdeclarative'
-          cache: 'true'
+        run: |
+          brew install qt@6
 
       - name: Setup Qt (Windows)
         if: runner.os == 'Windows'
         uses: jurplel/install-qt-action@v3
         with:
-          version: ${{ env.QT_VERSION }}
+          version: '6.7.0'
           host: 'windows'
           target: 'desktop'
-          modules: 'qtbase qtdeclarative'
-          cache: 'true'
+          arch: 'win64_msvc2022_64'
+          modules: 'qtbase qtsvg'
+          cache: true
 
-      - name: Setup build environment (Linux)
+      - name: Setup additional dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
           sudo apt-get install -y \
-            libgl1-mesa-dev \
-            libxkbcommon-x11-dev \
             libxcb-icccm4 \
             libxcb-image0 \
             libxcb-keysyms1 \
             libxcb-randr0 \
             libxcb-render-util0
 
-      - name: Setup build environment (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install cmake ninja
-
-      - name: Setup build environment (Windows)
+      - name: Setup MSVC (Windows)
         if: runner.os == 'Windows'
         uses: microsoft/setup-msbuild@v1
 
       - name: Create build directory
         run: mkdir -p build_release
 
-      - name: Configure CMake (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Configure CMake
         working-directory: build_release
         run: |
           cmake .. \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DNO_EXTERNAL=1
 
-      - name: Configure CMake (Windows)
+      - name: Build Release (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: build_release
+        run: cmake --build . --config Release -j$(if [ "$(uname)" = "Darwin" ]; then sysctl -n hw.ncpu; else nproc; fi)
+
+      - name: Build Release (Windows)
         if: runner.os == 'Windows'
         working-directory: build_release
-        run: |
-          cmake .. `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DBUILD_SHARED_LIBS=OFF `
-            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-
-      - name: Build Release
-        working-directory: build_release
-        run: ${{ matrix.build_cmd }}
+        run: cmake --build . --config Release -j %NUMBER_OF_PROCESSORS%
 
       - name: Get version
         id: version
+        shell: bash
         run: |
           if [ -f nekoray_version.txt ]; then
             VERSION=$(head -n 1 nekoray_version.txt | xargs)
@@ -135,13 +123,13 @@ jobs:
           else
             echo "version=unknown" >> $GITHUB_OUTPUT
           fi
-        shell: bash
 
       - name: Create release package (Linux/macOS)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           mkdir -p release_package
-          cp build_release/${{ matrix.artifact_name }} release_package/
+          cp build_release/${{ matrix.artifact_name }} release_package/ || true
           cd release_package
           tar -czf ../${{ matrix.asset_name }}-${{ steps.version.outputs.version }}.tar.gz .
           cd ..
@@ -149,28 +137,32 @@ jobs:
 
       - name: Create release package (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          mkdir release_package
-          copy build_release\${{ matrix.artifact_name }} release_package\
+          New-Item -ItemType Directory -Path release_package -Force
+          Copy-Item "build_release\${{ matrix.artifact_name }}" "release_package\" -ErrorAction SilentlyContinue
           cd release_package
-          tar -a -c -f ../${{ matrix.asset_name }}-${{ steps.version.outputs.version }}.zip .
+          $file = "${{ matrix.asset_name }}-${{ steps.version.outputs.version }}.zip"
+          7z a "..\$file" .
           cd ..
-          dir *.zip
+          Get-Item *.zip
 
-      - name: Generate checksums
+      - name: Generate checksums (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
-          python3 -c "
-          import hashlib
-          import os
-          import glob
-          
-          for f in glob.glob('*.tar.gz') + glob.glob('*.zip'):
-              with open(f, 'rb') as file:
-                  sha256 = hashlib.sha256(file.read()).hexdigest()
-                  with open(f + '.sha256', 'w') as hash_file:
-                      hash_file.write(sha256)
-                  print(f'{f}: {sha256}')
-          "
+          for f in *.tar.gz; do
+            [ -f "$f" ] && sha256sum "$f" > "$f.sha256"
+          done
+
+      - name: Generate checksums (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem *.zip | ForEach-Object {
+            $hash = (Get-FileHash $_ -Algorithm SHA256).Hash
+            "$hash" | Out-File "$($_.Name).sha256"
+          }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -192,11 +184,10 @@ jobs:
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-        with:
-          path: artifacts
 
       - name: Get version
         id: version
+        shell: bash
         run: |
           if [ -f nekoray_version.txt ]; then
             VERSION=$(head -n 1 nekoray_version.txt | xargs)
@@ -206,15 +197,9 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: artifacts/**/*
+          files: release-*/*
           draft: false
           prerelease: false
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload to Releases
-        run: |
-          echo "✓ Release created successfully!"
-          echo "Files:"
-          find artifacts -type f | head -20
