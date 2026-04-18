@@ -1,0 +1,318 @@
+name: Test Build Matrix
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact-pack:
+        description: "artifact-pack: If want ignore"
+        required: false
+        default: 'n'
+
+jobs:
+  build-deps:
+    strategy:
+      matrix:
+        cross_os: [windows, linux]
+        cross_arch: [amd64]
+        include:
+          - cross_os: public_res
+            cross_arch: public_res
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checking out sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Detect changes
+        run: git ls-files libs | xargs cat | sha1sum > deps_status
+
+      - name: Cache dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: libs/deps
+          key: DepCache-${{ matrix.cross_os }}-${{ matrix.cross_arch }}-${{ hashFiles('libs/*.sh', 'deps_status', '*.txt') }}
+
+      - name: Install Golang
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v4
+        with:
+          go-version: ^1.22
+
+      - name: Build dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          [ ${{ matrix.cross_os }} == public_res ] || ./libs/get_source.sh
+          [ ${{ matrix.cross_os }} == public_res ] || GOOS=${{ matrix.cross_os }} GOARCH=${{ matrix.cross_arch }} ./libs/build_go.sh
+          [ ${{ matrix.cross_os }} == public_res ] || exit 0
+          ./libs/build_public_res.sh
+
+      - name: Archive artifacts
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: tar czvf artifacts-${{ matrix.cross_os }}-${{ matrix.cross_arch }}.tgz ./deployment
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Deps-${{ github.run_id }}-${{ matrix.cross_os }}-${{ matrix.cross_arch }}
+          path: artifacts-${{ matrix.cross_os }}-${{ matrix.cross_arch }}.tgz
+          retention-days: 7
+
+  build-cpp:
+    needs: build-deps
+    strategy:
+      matrix:
+        include:
+          - platform: windows-2022
+            arch: x64
+            qt_version: "6.7"
+            triplet: x64-windows
+          - platform: ubuntu-20.04
+            arch: x64
+            qt_version: "6.7"
+            triplet: x64-linux
+      fail-fast: false
+
+    runs-on: ${{ matrix.platform }}
+    env:
+      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install MSVC (Windows)
+        if: matrix.platform == 'windows-2022'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          toolset: 14.2
+          arch: ${{ matrix.arch }}
+
+      - name: Download Qt SDK (Windows)
+        shell: bash
+        if: matrix.platform == 'windows-2022'
+        env:
+          DL_QT_VER: ${{ matrix.qt_version }}
+        run: bash ./libs/download_qtsdk_win.sh
+
+      - name: Install build tools
+        uses: seanmiddleditch/gha-setup-ninja@v4
+
+      - name: Cache CMake dependencies
+        id: cache-cmake-deps
+        uses: actions/cache@v4
+        with:
+          path: libs/deps
+          key: CMakeDeps-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('libs/build_deps*.sh') }}-Qt${{ matrix.qt_version }}
+
+      - name: Build CMake dependencies
+        shell: bash
+        if: steps.cache-cmake-deps.outputs.cache-hit != 'true' && matrix.platform != 'ubuntu-20.04'
+        run: ./libs/build_deps_all.sh
+
+      - name: Build CMake dependencies (Docker)
+        shell: bash
+        if: steps.cache-cmake-deps.outputs.cache-hit != 'true' && matrix.platform == 'ubuntu-20.04'
+        run: |
+          docker run --rm \
+            -v $PWD:/nekoray \
+            -w /nekoray \
+            ghcr.io/matsuridayo/debian10-qt5:20230131 \
+            bash -c "./libs/build_deps_all.sh"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: download-artifact
+
+      - name: Extract artifacts
+        shell: bash
+        run: |
+          find download-artifact -name "*.tgz" -exec tar xzvf {} \;
+
+      - name: Build Windows
+        shell: bash
+        if: matrix.platform == 'windows-2022'
+        env:
+          DL_QT_VER: ${{ matrix.qt_version }}
+          CC: cl.exe
+          CXX: cl.exe
+        run: |
+          source libs/env_qtsdk.sh $PWD/qtsdk/Qt
+          mkdir -p build
+          cd build
+          cmake -GNinja \
+            -DQT_VERSION_MAJOR=6 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNO_EXTERNAL=1 \
+            ..
+          ninja -j2
+          cd ..
+          ./libs/deploy_windows64.sh
+
+      - name: Build Linux (Docker)
+        shell: bash
+        if: matrix.platform == 'ubuntu-20.04'
+        run: |
+          docker run --rm \
+            -v $PWD:/nekoray \
+            -w /nekoray \
+            ghcr.io/matsuridayo/debian10-qt5:20230131 \
+            bash -c "
+              mkdir -p build && \
+              cd build && \
+              cmake -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DNO_EXTERNAL=1 \
+                .. && \
+              ninja && \
+              cd .. && \
+              ./libs/deploy_linux64.sh
+            "
+
+      - name: Archive build results
+        shell: bash
+        run: tar czvf artifacts-${{ matrix.platform }}-${{ matrix.arch }}.tgz ./deployment
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-${{ github.run_id }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifacts-${{ matrix.platform }}-${{ matrix.arch }}.tgz
+          retention-days: 7
+
+  pack-and-publish:
+    name: Pack & Publish
+    if: github.event.inputs.artifact-pack != 'y'
+    runs-on: ubuntu-latest
+    needs: build-cpp
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: download-artifact
+
+      - name: Extract all artifacts
+        shell: bash
+        run: |
+          mkdir -p deployment
+          find download-artifact -name "*.tgz" -exec tar xzvf {} \;
+
+      - name: Prepare deployment files
+        shell: bash
+        run: |
+          source libs/env_deploy.sh
+          
+          # Copy public resources
+          if [ -d "deployment/public_res" ]; then
+            cp -r deployment/public_res/* deployment/linux64/ 2>/dev/null || true
+            cp -r deployment/public_res/* deployment/windows64/ 2>/dev/null || true
+            rm -rf deployment/public_res
+          fi
+          
+          # Remove debug symbols
+          find deployment -name "*.pdb" -delete
+          find deployment -name "*.dbg" -delete
+
+      - name: Create Linux package
+        shell: bash
+        run: |
+          source libs/env_deploy.sh
+          
+          if [ -d "deployment/linux64" ]; then
+            cd deployment
+            mv linux64 nekobox
+            zip -r $version_standalone-linux64.zip nekobox
+            rm -rf nekobox
+            cd ..
+          fi
+
+      - name: Create Windows package
+        shell: bash
+        run: |
+          source libs/env_deploy.sh
+          
+          if [ -d "deployment/windows64" ]; then
+            cd deployment
+            mv windows64 nekobox
+            zip -r $version_standalone-windows64.zip nekobox
+            rm -rf nekobox
+            cd ..
+          fi
+
+      - name: Create Debian package
+        shell: bash
+        run: |
+          source libs/env_deploy.sh
+          
+          if [ -d "deployment/linux64" ]; then
+            mkdir -p deployment/linux64_deb
+            cp -r deployment/linux64/* deployment/linux64_deb/
+            cd deployment
+            cd linux64_deb
+            bash ../../libs/package_debian.sh
+            mv nekobox.deb ../$version_standalone-debian-x64.deb
+            cd ..
+            rm -rf linux64_deb
+          fi
+
+      - name: Create AppImage package
+        shell: bash
+        run: |
+          source libs/env_deploy.sh
+          
+          if [ -d "deployment/linux64" ]; then
+            cd deployment
+            bash ../libs/package_appimage.sh
+            mv nekobox-x86_64.AppImage $version_standalone-linux-x64.AppImage
+            cd ..
+          fi
+
+      - name: List packages
+        shell: bash
+        run: |
+          echo "=== Build Artifacts ==="
+          ls -lh deployment/*.zip deployment/*.deb deployment/*.AppImage 2>/dev/null || true
+
+      - name: Upload final artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Release-${{ github.run_id }}
+          path: |
+            deployment/*.zip
+            deployment/*.deb
+            deployment/*.AppImage
+          retention-days: 30
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd deployment
+          for f in *.zip *.deb *.AppImage; do
+            [ -f "$f" ] && sha256sum "$f" > "$f.sha256"
+          done
+          ls -lh *.sha256 2>/dev/null || true
+          cd ..
+
+      - name: Build summary
+        shell: bash
+        run: |
+          echo "# Test Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Time:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Build Status" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Windows Build: Success" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Linux Build: Success" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Artifacts" >> $GITHUB_STEP_SUMMARY
+          ls -lh deployment/*.zip deployment/*.deb deployment/*.AppImage 2>/dev/null | awk '{print "- `" $9 "` (" $5 ")"}' >> $GITHUB_STEP_SUMMARY || echo "No artifacts found" >> $GITHUB_STEP_SUMMARY
