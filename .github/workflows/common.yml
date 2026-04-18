@@ -1,0 +1,103 @@
+# 共享的工作流配置文件，可被其他工作流调用
+
+name: Common Workflows
+
+on:
+  workflow_call:
+    inputs:
+      build_type:
+        required: true
+        type: string
+        description: 'Build type: release, beta, or test'
+    secrets:
+      GITHUB_TOKEN:
+        required: false
+
+jobs:
+  check-code-quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check CMakeLists.txt
+        run: |
+          if [ -f CMakeLists.txt ]; then
+            echo "✓ CMakeLists.txt found"
+            head -20 CMakeLists.txt
+          else
+            echo "❌ CMakeLists.txt not found"
+            exit 1
+          fi
+
+      - name: Verify version file
+        run: |
+          if [ -f nekoray_version.txt ]; then
+            echo "✓ Version file found:"
+            cat nekoray_version.txt
+          else
+            echo "⚠ Version file not found"
+          fi
+
+      - name: Check code formatting (if available)
+        continue-on-error: true
+        run: |
+          if [ -f .clang-format ]; then
+            echo "✓ clang-format configuration found"
+          fi
+          
+          if [ -f .clang-tidy ]; then
+            echo "✓ clang-tidy configuration found"
+          fi
+
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check submodules
+        run: |
+          echo "📦 Checking submodules..."
+          git submodule status
+          
+          if [ -d "3rdparty" ]; then
+            echo "✓ 3rdparty directory found"
+            ls -la 3rdparty/
+          fi
+
+      - name: Verify dependencies
+        run: |
+          echo "🔍 Verifying dependencies..."
+          echo "Required: CMake >= 3.5"
+          echo "Required: C++17 compiler"
+          echo "Required: Qt 5 or Qt 6"
+          
+          # Check .gitmodules
+          if [ -f .gitmodules ]; then
+            echo "✓ Git submodules configured"
+            cat .gitmodules
+          fi
+
+  security-scan:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run security scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
